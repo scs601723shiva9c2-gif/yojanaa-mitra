@@ -671,6 +671,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       if (user) {
         setIsFirebaseConnected(true);
+        // Ensure authentication token is completely settled before setting up snapshot listeners
+        try {
+          await user.getIdToken();
+          await new Promise((resolve) => setTimeout(resolve, 60));
+        } catch (tokenErr) {
+          console.warn('Token sync notice:', tokenErr);
+        }
+
+        // Verify current auth user still matches before attaching listeners
+        if (!auth.currentUser || auth.currentUser.uid !== user.uid) {
+          return;
+        }
+
         const userDocRef = doc(db, 'users', user.uid);
         
         // Listen to User Profile Document
@@ -732,7 +745,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             }
           },
           (error) => {
-            handleFirestoreError(error, OperationType.GET, `users/${user.uid}`);
+            if (auth.currentUser && auth.currentUser.uid === user.uid) {
+              handleFirestoreError(error, OperationType.GET, `users/${user.uid}`);
+            }
           }
         );
 
@@ -748,7 +763,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             setAppliedSchemes(items);
           },
           (error) => {
-            handleFirestoreError(error, OperationType.LIST, `users/${user.uid}/appliedSchemes`);
+            if (auth.currentUser && auth.currentUser.uid === user.uid) {
+              handleFirestoreError(error, OperationType.LIST, `users/${user.uid}/appliedSchemes`);
+            }
           }
         );
 
@@ -764,7 +781,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             setNotifications(items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
           },
           (error) => {
-            handleFirestoreError(error, OperationType.LIST, `users/${user.uid}/notifications`);
+            if (auth.currentUser && auth.currentUser.uid === user.uid) {
+              handleFirestoreError(error, OperationType.LIST, `users/${user.uid}/notifications`);
+            }
           }
         );
       } else {
@@ -845,7 +864,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const unreadNotificationCount = notifications.filter(n => !n.read).length;
 
   const loginWithGoogle = async (preferredEmail?: string, preferredName?: string) => {
-    // 1. Clear any active Firebase user session so Google prompt='select_account' can freely show account list
+    // 1. Clean up active listeners first to avoid spurious permission-denied events on unauthenticated state
+    if (unsubProfileRef.current) { unsubProfileRef.current(); unsubProfileRef.current = null; }
+    if (unsubAppsRef.current) { unsubAppsRef.current(); unsubAppsRef.current = null; }
+    if (unsubNotifsRef.current) { unsubNotifsRef.current(); unsubNotifsRef.current = null; }
+
+    // 2. Clear any active Firebase user session so Google prompt='select_account' can freely show account list
     if (auth.currentUser) {
       try {
         await signOut(auth);
@@ -1302,6 +1326,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const logout = async () => {
+    if (unsubProfileRef.current) { unsubProfileRef.current(); unsubProfileRef.current = null; }
+    if (unsubAppsRef.current) { unsubAppsRef.current(); unsubAppsRef.current = null; }
+    if (unsubNotifsRef.current) { unsubNotifsRef.current(); unsubNotifsRef.current = null; }
+
     if (auth.currentUser) {
       await signOut(auth);
     }
@@ -1695,55 +1723,77 @@ Official Portal Link: ...
 3. MANDATORY OFFICIAL PORTAL LINK REQUIREMENT:
 For EVERY scheme and scholarship mentioned in your response, you MUST provide its valid official government portal URL or application link in Markdown (e.g. [Official Application Portal](https://jnanabhumi.ap.gov.in) or **Official Application Link:** https://...). Restrict all verification strictly to official government portals (.gov.in, .nic.in, .apcfss.in, myscheme.gov.in). Never omit the application link for any scheme.`;
 
+    // Find all state-related schemes strictly for this state that match user credentials
+    const eligibleStateSchemes = SCHEMES_DATABASE.filter(s => {
+      if (s.governmentLevel === 'Central' || s.state === 'All India') return false;
+      const isThisState = s.state.toLowerCase() === targetState.toLowerCase() || 
+        (s.eligibilityRules?.states?.some(st => st.toLowerCase() === targetState.toLowerCase()) ?? false);
+      if (!isThisState) return false;
+      const evalRes = evaluateSchemeEligibility(s, profile);
+      return evalRes.unmetCriteria.length === 0;
+    });
+
+    let reply = '';
+    let schemesToRecommend = eligibleStateSchemes;
+
     try {
+      const controller = new AbortController();
+      const timeoutTimer = setTimeout(() => controller.abort(), 12000);
+
       const res = await fetch('/api/ai/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           message: promptMessage,
           history: [],
           userProfile: profile
         })
       });
+      clearTimeout(timeoutTimer);
 
-      const data = await res.json();
-      const reply = data.reply || `Verified active government schemes for residents of ${targetState}.`;
-
-      setStateChatbotAnswer({
-        state: targetState,
-        text: reply,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      });
-
-      // Find all state-related schemes strictly for this state that match user credentials
-      const eligibleStateSchemes = SCHEMES_DATABASE.filter(s => {
-        if (s.governmentLevel === 'Central' || s.state === 'All India') return false;
-        const isThisState = s.state.toLowerCase() === targetState.toLowerCase() || 
-          (s.eligibilityRules?.states?.some(st => st.toLowerCase() === targetState.toLowerCase()) ?? false);
-        if (!isThisState) return false;
-        const evalRes = evaluateSchemeEligibility(s, profile);
-        return evalRes.unmetCriteria.length === 0;
-      });
-
-      // Filter strictly to only those schemes mentioned or identified in the chatbot text response
-      const onlyMatchedSchemes = matchSchemesFromAiResponse(reply, eligibleStateSchemes, profile);
-
-      // Add each matched state scheme to chatbot recommendations
-      onlyMatchedSchemes.forEach(scheme => {
-        addChatbotRecommendation(
-          scheme,
-          `🏛️ State Govt Entitlement: Official Government of ${targetState} initiative verified for you.`,
-          `Chatbot State Query (${targetState})`
-        );
-      });
-
-      return { reply, foundSchemes: onlyMatchedSchemes };
-    } catch (err) {
-      console.error('Error querying chatbot for state schemes:', err);
-      return { reply: '', foundSchemes: [] };
+      if (res.ok) {
+        const data = await res.json();
+        if (data.reply) {
+          reply = data.reply;
+          schemesToRecommend = matchSchemesFromAiResponse(reply, eligibleStateSchemes, profile);
+          if (schemesToRecommend.length === 0) {
+            schemesToRecommend = eligibleStateSchemes;
+          }
+        }
+      }
+    } catch {
+      console.log('Using verified local state scheme database for response.');
     } finally {
       setIsAskingStateSchemes(false);
     }
+
+    if (!reply) {
+      if (eligibleStateSchemes.length > 0) {
+        reply = `Here are verified active Government of ${targetState} welfare schemes matching your profile:\n\n` +
+          eligibleStateSchemes.map((s, idx) => `${idx + 1}.\n**Scheme Name:** ${s.name}\n**Requirements:** ${s.eligibility?.join(', ') || s.shortDescription || 'Valid state domicile, Aadhaar, and required income/caste certificate.'}\n**Why it suits you:** ${s.financialBenefitAmount ? `Provides ${s.financialBenefitAmount} direct entitlement.` : 'Direct state government support matching your profile.'}\n**Deadline:** ${s.deadline || 'Check Official Portal'}\n**Official Portal Link:** [${s.officialSource || 'Official Government Portal'}](${s.officialWebsite || 'https://www.myscheme.gov.in'})`).join('\n\n');
+      } else {
+        reply = `Verified active government schemes for residents of ${targetState}. Please consult the official state portal or MeeSeva for current enrollment guidelines.`;
+      }
+      schemesToRecommend = eligibleStateSchemes;
+    }
+
+    setStateChatbotAnswer({
+      state: targetState,
+      text: reply,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    });
+
+    // Add matched state schemes to chatbot recommendations
+    schemesToRecommend.forEach(scheme => {
+      addChatbotRecommendation(
+        scheme,
+        `🏛️ State Govt Entitlement: Official Government of ${targetState} initiative verified for you.`,
+        `Chatbot State Query (${targetState})`
+      );
+    });
+
+    return { reply, foundSchemes: schemesToRecommend };
   };
 
   return (

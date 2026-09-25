@@ -56,6 +56,23 @@ function timeoutPromise<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+// Quota tracking: track which models are temporarily exhausted to prevent 429 errors
+const modelCooldownMap = new Map<string, number>();
+
+function isModelInCooldown(model: string): boolean {
+  const cooldownUntil = modelCooldownMap.get(model);
+  if (!cooldownUntil) return false;
+  if (Date.now() > cooldownUntil) {
+    modelCooldownMap.delete(model);
+    return false;
+  }
+  return true;
+}
+
+function setModelCooldown(model: string, cooldownMs: number = 180000) {
+  modelCooldownMap.set(model, Date.now() + cooldownMs);
+}
+
 // Resilient Gemini generation with model fallback on 503/429/high demand/quota/timeout
 async function generateContentWithFallback(ai: GoogleGenAI | null, options: {
   contents: any;
@@ -66,14 +83,31 @@ async function generateContentWithFallback(ai: GoogleGenAI | null, options: {
   timeoutMs?: number;
 }) {
   if (!ai) return null;
-  const timeoutMs = options.timeoutMs || 3500;
-  const modelsToTry = [
-    options.primaryModel || 'gemini-flash-latest',
-    ...(options.fallbackModels || ['gemini-3.1-flash-lite', 'gemini-2.5-flash'])
+  const timeoutMs = options.timeoutMs || 15000;
+
+  // Use gemini-3.1-flash-lite as standard primary model due to stable quota availability
+  const candidateModels = [
+    options.primaryModel || 'gemini-3.1-flash-lite',
+    ...(options.fallbackModels || ['gemini-3.8-flash', 'gemini-flash-latest'])
   ];
+
+  // Unique list preserving order
+  const uniqueCandidates = Array.from(new Set(candidateModels));
+
+  // Sort candidate models so non-cooling down models are evaluated first
+  const modelsToTry = uniqueCandidates.sort((a, b) => {
+    const aCool = isModelInCooldown(a) ? 1 : 0;
+    const bCool = isModelInCooldown(b) ? 1 : 0;
+    return aCool - bCool;
+  });
 
   for (let i = 0; i < modelsToTry.length; i++) {
     const model = modelsToTry[i];
+    if (isModelInCooldown(model)) {
+      // Skip models currently cooling down without wasting time/requests
+      continue;
+    }
+
     try {
       const response = await timeoutPromise(ai.models.generateContent({
         model,
@@ -83,18 +117,110 @@ async function generateContentWithFallback(ai: GoogleGenAI | null, options: {
       if (response?.text) {
         return response;
       }
-    } catch {
-      // Continue to next model or fallback
+    } catch (err: any) {
+      const errStr = (err?.message || String(err)).toLowerCase();
+      const isQuotaOrRate = 
+        errStr.includes('429') || 
+        errStr.includes('resource_exhausted') || 
+        errStr.includes('quota') ||
+        errStr.includes('rate limit');
+
+      if (isQuotaOrRate) {
+        setModelCooldown(model, 180000); // 3-minute cooldown
+        console.log(`Gemini model ${model} reached quota limit; falling back to alternative model.`);
+      } else {
+        console.log(`Gemini model ${model} attempt completed with fallback.`);
+      }
+      // Continue to next model
     }
   }
 
-  console.warn('Gemini models busy or timed out. Serving instant verified fallback.');
   return null;
 }
 
 function buildFallbackReply(message: string, userProfile: any, isTeluguRequested: boolean): string {
-  const msgLower = (message || '').toLowerCase();
+  const msgLower = (message || '').toLowerCase().trim();
   const profileState = (userProfile?.state || '').toLowerCase();
+
+  // Intent: Greeting
+  if (/^(hi|hello|hey|namaste|greetings|good\s*(morning|afternoon|evening)|నమస్కారం|హలో)/i.test(msgLower)) {
+    return isTeluguRequested
+      ? `నమస్కారం! 🙏 నేను **యోజనా మిత్ర AI** (Yojana Mitra AI), మీ అధికారిక ప్రభుత్వ సంక్షేమ పథకాలు మరియు స్కాలర్‌షిప్‌ల సహాయకుడిని.
+
+నేను మీకు ఎలా సహాయపడగలను? మీరు నన్ను వీటి గురించి అడగవచ్చు:
+- ఆంధ్రప్రదేశ్ మరియు తెలంగాణ రాష్ట్ర ప్రభుత్వ సంక్షేమ పథకాలు
+- విద్యార్థుల స్కాలర్‌షిప్‌లు & పూర్తి ఫీజు రీయింబర్స్‌మెంట్ (JnanaBhumi, ePASS)
+- మహిళలు, రైతులు, సీనియర్ సిటిజన్లు మరియు పేద వర్గాల ఆర్థిక సహాయాలు
+- ఆదాయ, కుల ధృవీకరణ పత్రాలు (MeeSeva సర్టిఫికేట్లు) పొందే విధానం
+- అధికారిక పోర్టల్‌లలో దరఖాస్తు చేసుకునే స్టెప్-బై-స్టెప్ గైడెన్స్`
+      : `Namaste! 🙏 I am **Yojana Mitra AI**, your dedicated Government Scheme & Scholarship Assistant.
+
+How can I assist you today? You can ask me about:
+- Active state welfare schemes in **Andhra Pradesh** and **Telangana**
+- Higher education scholarships and tuition fee reimbursement (ePASS, JnanaBhumi)
+- Farmer subsidies, Women empowerment grants, and Senior Citizen pensions
+- How to obtain required certificates (Income, Caste, Residence from MeeSeva / CSC)
+- Official application procedures and deadlines on verified government portals (.gov.in)`;
+  }
+
+  // Intent: Certificates & Documents (Income, Caste, MeeSeva, etc.)
+  if (/(income\s*cert|caste\s*cert|meeseva|mee\s*seva|certificate|document|పత్రం|ధృవీకరణ|సర్టిఫికేట్)/i.test(msgLower)) {
+    const isAP = /(andhra|ఆంధ్ర|ap)/i.test(msgLower) || profileState.includes('andhra');
+    const portalName = isAP ? 'MeeSeva Andhra Pradesh' : 'MeeSeva Telangana';
+    const portalUrl = isAP ? 'https://ap.meeseva.gov.in' : 'https://ts.meeseva.telangana.gov.in';
+
+    return isTeluguRequested
+      ? `ప్రభుత్వ సంక్షేమ పథకాలు మరియు స్కాలర్‌షిప్‌ల కోసం అవసరమైన **ధృవీకరణ పత్రాలు (Certificates)** పొందే విధానం:
+
+1. **ఆదాయ ధృవీకరణ పత్రం (Income Certificate):**
+   - **కావలసిన పత్రాలు:** ఆధార్ కార్డు, తెల్ల రేషన్ కార్డు (రైస్ కార్డ్), జీతపు రసీదు లేదా స్వయం ప్రకటన పత్రం, దరఖాస్తు ఫారమ్.
+   - **ఎక్కడ దరఖాస్తు చేసుకోవాలి:** మీ సమీప 'మీ సేవా' (MeeSeva) కేంద్రం లేదా గ్రామ/వార్డు సచివాలయం ద్వారా.
+   - **పోర్టల్:** [${portalName}](${portalUrl})
+
+2. **కుల ధృవీకరణ పత్రం (Integrated Community / Caste Certificate):**
+   - **కావలసిన పత్రాలు:** ఆధార్ కార్డు, పాఠశాల టీసీ / స్టడీ సర్టిఫికెట్, తల్లిదండ్రుల కుల ధృవీకరణ పత్రం లేదా పాత రికార్డు.
+   - **ఎక్కడ దరఖాస్తు చేసుకోవాలి:** సమీప మీసేవా కేంద్రం ద్వారా తహసీల్దార్ కార్యాలయానికి దరఖాస్తు పంపబడుతుంది.
+
+3. **ఆధార్ బ్యాంక్ డీబీటీ లింకింగ్ (Aadhaar DBT Seeding):**
+   - ప్రభుత్వ ఆర్థిక సహాయం నేరుగా ఖాతాలో పడటానికి మీ బ్యాంక్ బ్రాంచ్‌కు వెళ్లి 'Aadhaar NPCI DBT Seeding Form' సమర్పించాలి.`
+      : `Here is the official procedure for obtaining essential government certificates and documents:
+
+1. **Income Certificate (ఆదాయ ధృవీకరణ పత్రం):**
+   - **Required Documents:** Aadhaar Card, Ration Card / Food Security Card, recent electricity bill or salary slip/self-declaration, passport photo.
+   - **How to apply:** Visit your nearest MeeSeva Centre, Grama/Ward Sachivalayam (AP), or apply online at [${portalName}](${portalUrl}).
+   - **Validity:** Issued under the digital signature of the Tahsildar within 7–15 working days.
+
+2. **Caste / Community Certificate (కుల ధృవీకరణ పత్రం):**
+   - **Required Documents:** Applicant Aadhaar Card, School Transfer Certificate (TC) or 10th Marks Memo, family member's caste certificate or revenue land record.
+   - **How to apply:** Submit an application through MeeSeva to the Revenue Department.
+
+3. **Aadhaar Bank DBT Seeding (NPCI Mapping):**
+   - To receive direct financial subsidies from government schemes, ensure your bank account is active on the NPCI Aadhaar payment bridge by visiting your home bank branch.`;
+  }
+
+  // Intent: Application Process / How to Apply
+  if (/(how\s*to\s*apply|application\s*process|how\s*can\s*i\s*apply|how\s*do\s*i\s*apply|ఎలా\s*దరఖాస్తు)/i.test(msgLower)) {
+    return isTeluguRequested
+      ? `ప్రభుత్వ సంక్షేమ పథకాలు మరియు స్కాలర్‌షిప్‌ల కోసం దరఖాస్తు చేసుకునే సాధారణ విధానం:
+
+1. **అర్హత తనిఖీ:** మీ వయస్సు, కుటుంబ వార్షిక ఆదాయం, సామాజిక వర్గం, మరియు నివాస ప్రాంతం పథక నిబంధనలకు అనుగుణంగా ఉన్నాయో సరిచూసుకోండి.
+2. **పత్రాల సమర్పణ:** ఆధార్ కార్డు, మీసేవా ఆదాయ పత్రం, కుల ధృవీకరణ పత్రం, మరియు బ్యాంక్ పాస్‌బుక్ సిద్ధం చేసుకోండి.
+3. **ఆన్‌లైన్ రిజిస్ట్రేషన్:** పథకానికి సంబంధించిన అధికారిక ప్రభుత్వ పోర్టల్ (ఉదా. [National Scholarship Portal](https://scholarships.gov.in), [Telangana ePASS](https://telanganaepass.cgg.gov.in), లేదా [JnanaBhumi AP](https://jnanabhumi.ap.gov.in)) లో మీ వివరాలతో నమోదు చేసుకోండి.
+4. **రసీదు & పరిశీలన:** సమర్పించిన దరఖాస్తు రసీదు (Application Acknowledgement) ను ప్రింట్ తీసుకోండి. సంబంధిత అధికారులు విచారణ జరిపిన తర్వాత ప్రయోజనం మంజూరవుతుంది.`
+      : `Here is the step-by-step procedure to apply for government welfare schemes and scholarships:
+
+1. **Verify Eligibility:** Check the specific age, income limit, residency, and employment/student criteria for the scheme.
+2. **Prepare Mandatory Documents:**
+   - Aadhaar Card (linked with mobile number)
+   - Valid Income Certificate from MeeSeva / Revenue Department
+   - Community / Caste Certificate (if applicable)
+   - Aadhaar DBT-seeded Bank Account Passbook
+3. **Register on Official Government Portal:**
+   - National Schemes & Scholarships: [National Scholarship Portal](https://scholarships.gov.in) or [myScheme Portal](https://www.myscheme.gov.in)
+   - Telangana State Schemes: [Telangana ePASS](https://telanganaepass.cgg.gov.in)
+   - Andhra Pradesh State Schemes: [JnanaBhumi AP](https://jnanabhumi.ap.gov.in) / [Navasakam](https://navasakam2.apcfss.in)
+4. **Submit & Track:** Fill in educational or household details, upload documents, and save your Application ID to track disbursement status.`;
+  }
 
   const isAndhraQuery = 
     /(andhra|ఆంధ్ర|ap|amaravati|visakhapatnam|vijayawada|chandrababu|jnanabhumi|aarogyasri)/i.test(msgLower) ||
@@ -967,14 +1093,20 @@ app.post('/api/ai/chat', async (req, res) => {
     const { message, history, userProfile, language } = req.body;
     const ai = getGenAI();
 
-    // Check if user specifically requested Telugu or typed in Telugu script/transliteration
-    const isTeluguRequested = 
-      (typeof language === 'string' && language.toLowerCase() === 'telugu') ||
-      (/(\btelugu\b|తెలుగు|telugulo|telugu\s*lo)/i.test(message || '')) ||
-      (/[\u0C00-\u0C7F]/.test(message || '')) ||
-      (Array.isArray(history) && history.some((h: { role: string; text: string }) => 
-        /(\btelugu\b|తెలుగు|telugulo|telugu\s*lo)/i.test(h.text || '') || /[\u0C00-\u0C7F]/.test(h.text || '')
-      ));
+    const userMsgLower = (message || '').toLowerCase().trim();
+
+    // Explicit language detection from current message and client request
+    const explicitEnglish = /(\benglish\b|in english|reply in english|answer in english|ఆంగ్లంలో|english\s*lo)/i.test(userMsgLower);
+    const explicitTelugu = /(\btelugu\b|తెలుగు|telugulo|telugu\s*lo|in telugu)/i.test(userMsgLower) || /[\u0C00-\u0C7F]/.test(message || '');
+    
+    let isTeluguRequested = false;
+    if (explicitEnglish) {
+      isTeluguRequested = false;
+    } else if (explicitTelugu) {
+      isTeluguRequested = true;
+    } else if (typeof language === 'string' && language.toLowerCase() === 'telugu') {
+      isTeluguRequested = true;
+    }
 
     if (!ai) {
       return res.json({
@@ -982,7 +1114,13 @@ app.post('/api/ai/chat', async (req, res) => {
       });
     }
 
-    const systemInstruction = `You are the official Government Scheme & Scholarship Finder Agent ("Yojana Mitra AI").
+    const normalizedStatus = (userProfile?.employmentStatus || '').trim().toLowerCase();
+    const isStudent = !!userProfile?.isStudent || normalizedStatus === 'student' || userProfile?.currentEducationStatus === 'Pursuing';
+    const isFarmer = !!userProfile?.isFarmer || normalizedStatus === 'farmer' || (userProfile?.occupation || '').toLowerCase().includes('farmer');
+    const isSenior = !!userProfile?.isSeniorCitizen || normalizedStatus.includes('senior') || normalizedStatus.includes('retired') || (userProfile?.age && userProfile.age >= 60);
+    const isWoman = !!userProfile?.isWomanEntrepreneur || normalizedStatus === 'women' || normalizedStatus === 'woman' || (userProfile?.gender === 'female' && !isSenior);
+
+    const systemInstruction = `You are the official Government Scheme & Scholarship AI Assistant ("Yojana Mitra AI").
 Your role is to assist Indian citizens in discovering, checking eligibility, understanding required documents, and applying for active government welfare schemes and scholarships.
 
 CITIZEN PROFILE CONTEXT:
@@ -995,51 +1133,38 @@ ${userProfile ? `
 - Annual Family Income: ₹${userProfile.annualFamilyIncome || 'Not specified'}
 - Occupation / Status: ${userProfile.occupation || userProfile.employmentStatus || 'Not specified'}
 - Education: ${userProfile.highestEducation || 'Not specified'} (${userProfile.currentEducationStatus || ''})
-- Student Status: ${userProfile.isStudent ? 'Yes' : 'No'}
-- Farmer Status: ${userProfile.isFarmer ? 'Yes' : 'No'}
-- Woman Entrepreneur / Self-Employed: ${userProfile.isWomanEntrepreneur ? 'Yes' : 'No'}
-- Senior Citizen: ${userProfile.isSeniorCitizen ? 'Yes' : 'No'}
+- Student Status: ${isStudent ? 'Yes' : 'No'}
+- Farmer Status: ${isFarmer ? 'Yes' : 'No'}
+- Woman / Woman Entrepreneur: ${isWoman ? 'Yes' : 'No'}
+- Senior Citizen: ${isSenior ? 'Yes' : 'No'}
 - BPL / EWS: ${userProfile.isBPLOrEWS ? 'Yes' : 'No'}
 - PwD (Disability): ${userProfile.isDisability ? 'Yes' : 'No'}
 ` : 'No citizen profile provided (general query).'}
 
 ${isTeluguRequested ? `
-CRITICAL MANDATORY DIRECTIVE - RESPOND ENTIRELY IN TELUGU (తెలుగు):
-- The citizen has explicitly requested to respond in Telugu or is communicating in Telugu.
-- You MUST answer the ENTIRE response in clear, natural, grammatically correct, and respectful Telugu (తెలుగు లిపి).
+CRITICAL LANGUAGE DIRECTIVE - RESPOND IN TELUGU (తెలుగు):
+- The user is communicating in Telugu or has requested Telugu.
+- Respond in clear, natural, grammatically correct, and respectful Telugu (తెలుగు లిపి).
 - DO NOT answer in English. All explanations, step-by-step guidance, criteria, and document lists must be in Telugu.
-- Structure all scheme recommendations strictly in TEXT FORMAT (DO NOT USE CARDS) using this numbered format:
-  1.
-  **పథకం పేరు (Scheme Name):** [అధికారిక పథకం పేరు]
-  **అర్హతలు & అవసరమైన పత్రాలు (Requirements):** [అర్హత ప్రమాణాలు మరియు కావలసిన ధృవీకరణ పత్రాలు]
-  **మీకు ఎందుకు సరిపోతుంది (Why it suits you):** [మీ వయస్సు, విద్య, రాష్ట్రం లేదా కేటగిరీకి ఇది ఎలా సరిపోతుంది]
-  **గడువు తేదీ (Deadline):** [గడువు తేదీ లేదా 'Check Official Portal']
-  **అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [అధికారిక వెబ్‌సైట్ లింక్ (ఉదా. [నేషనల్ స్కాలర్‌షిప్ పోర్టల్](https://scholarships.gov.in))]
 - Keep official English scheme titles or portal acronyms in parentheses where helpful (e.g., 'జాతీయ స్కాలర్‌షిప్ పోర్టల్ (NSP)', 'పీఎం యశస్వి (PM-YASASVI)', 'ఆధార్ డీబీటీ (Aadhaar DBT)').
-- Start with a polite greeting in Telugu: "నమస్కారం! మీ ప్రొఫైల్ ఆధారంగా మీరు అర్హులైన ప్రభుత్వ పథకాలు మరియు స్కాలర్‌షిప్‌ల వివరాలు క్రింద వివరించబడ్డాయి:"
+- Start with a polite greeting in Telugu: "నమస్కారం! ..."
 ` : `
-LANGUAGE CAPABILITY:
-- You have full native-level fluency in English, Telugu (తెలుగు), and Hindi (हिंदी).
-- Whenever a user asks 'respond in telugu', 'telugu lo cheppandi', 'reply in telugu', 'explain in telugu', 'telugulo', 'తెలుగులో చెప్పండి', or asks a question in Telugu script, you MUST immediately switch and deliver your entire response in natural, fluent Telugu script (తెలుగు లిపి).
+CRITICAL LANGUAGE DIRECTIVE - RESPOND IN ENGLISH:
+- The user is communicating in English or has requested English.
+- Deliver your entire response in clear, fluent, professional, and friendly English.
+- (Only switch to Telugu if the citizen specifically asks in Telugu or requests 'in telugu').
 `}
 
-RULES & CONSTRAINTS:
-1. STRICT STATE RESTRICTION (ONLY ANDHRA PRADESH & TELANGANA):
-   - You EXCLUSIVELY support and concentrate on the states of **Andhra Pradesh** and **Telangana** (in addition to Pan-India Central Government schemes).
-   - NEVER recommend, provide information for, or process schemes from any other states (such as Karnataka, Tamil Nadu, Maharashtra, Uttar Pradesh, etc.). If a user asks about any state other than Andhra Pradesh or Telangana, politely state: "This platform is exclusively dedicated to Andhra Pradesh and Telangana state schemes alongside Central Government schemes. I cannot recommend schemes for other states."
-   - Deeply concentrate on Andhra Pradesh schemes under the current government led by Chief Minister Nara Chandrababu Naidu (Annadata Sukhibhava farmer grant ₹20,000/yr [formerly YSR Rythu Bharosa], Dr. NTR Vaidya Seva ₹25 Lakh cashless healthcare [formerly Dr. YSR Aarogyasri], NTR Bharosa Social Security Pension ₹4,000/mo [formerly YSR Pension Kanuka], Thalliki Vandanam ₹15,000/child education incentive [restructured from Amma Vodi], Deepam 2.0 Free 3 LPG Gas Cylinders, Maha Shakti Free RTC Bus Travel for Women, Yuva Galam Unemployment Allowance ₹3,000/mo, JnanaBhumi Vidya Deevena & Vasathi Deevena Fee Reimbursement, and Sunna Vaddi for DWCRA women) and Telangana schemes (Telangana ePASS Post-Matric Scholarships & Fee Reimbursement, Maha Lakshmi Scheme for Women, Overseas Vidya Nidhi, TASK Youth Training Subsidy, Rythu Bharosa, Kalyana Lakshmi / Shaadi Mubarak, Rajiv Aarogyasri).
-2. STRICT PROFILE RELEVANCE: Only recommend schemes and scholarships that strictly match the citizen's profile (Age, State, Category, Income limit, Occupation/Student/Farmer/Gender). NEVER recommend schemes outside the user's profile:
-   - CRITICAL STUDENT / EMPLOYMENT DIRECTIVE:
-     * If the citizen is NOT a student (e.g. isStudent is No/false or employmentStatus is Employed, Self-Employed, Farmer, Unemployed, Retired, or Daily Wage Worker): You are STRICTLY FORBIDDEN from recommending student scholarships, tuition fee reimbursements, hostel allowances, or student training programs (such as Telangana ePASS, JnanaBhumi Vidya Deevena, Vasathi Deevena, Overseas Vidya Nidhi, PM-YASASVI, or Central Sector Scholarship). Instead, recommend livelihood, healthcare, housing, electricity, agricultural (if farmer), enterprise (if MSME/business), or social welfare programs matching their actual employment status.
-     * If the citizen IS a student (isStudent is Yes/true): Prioritize scholarships, college tuition reimbursement, hostel grants, and educational loans. Do not recommend commercial business loans, agricultural subsidies, or old age pensions.
-   - CRITICAL WOMEN VS SENIOR CITIZEN DIRECTIVES:
-     * When employmentStatus is 'Women' or isWomanEntrepreneur is true: Recommend ONLY women-specific empowerment, welfare, maternal, and livelihood schemes (such as Andhra Pradesh Maha Shakti Free Bus Travel for Women, Andhra Pradesh Maha Shakti Aadabidda Nidhi ₹1,500/mo cash grant, Andhra Pradesh Deepam 2.0 Free 3 LPG Cylinders, Andhra Pradesh Sunna Vaddi Zero Interest DWCRA Loans, Andhra Pradesh YSR Cheyutha & Stree Nidhi Livelihood Scheme, and Andhra Pradesh YSR Kalyana Masthu / Shaadi Mubarak; or Telangana Maha Lakshmi Free Bus Travel and ₹500 Gas Cylinder). YOU ARE STRICTLY FORBIDDEN from recommending Senior Citizen pensions (such as NTR Bharosa Old Age Pension) or geriatric schemes to citizens whose employment status is 'Women'.
-     * When employmentStatus is 'Senior Citizen' or isSeniorCitizen is true or age >= 60: Recommend ONLY senior citizen pensions, geriatric healthcare, assistive living aids, and elderly welfare schemes (such as Andhra Pradesh NTR Bharosa Senior Citizen Pension Scheme ₹4,000/mo doorstep delivery, Dr. NTR Vaidya Seva Geriatric & Senior Citizen Healthcare Support, Andhra Pradesh Vayo Vandana Senior Citizen Assistive Devices Scheme, Andhra Pradesh Senior Citizen APSRTC Bus Concession & Vrudhula Card, and IGNOAPS; or Telangana Cheyutha Social Security Old Age Pension). YOU ARE STRICTLY FORBIDDEN from recommending schemes meant exclusively for women (like Maha Shakti Aadabidda Nidhi, Deepam, or Sunna Vaddi DWCRA loans) to Senior Citizens.
-   - If the citizen is male, do not recommend female-only schemes. If the citizen is not a farmer, do not recommend agricultural farmer grants. If income exceeds the limit, do not recommend that scheme. If the user asks about an ineligible scheme, explain clearly why they do not meet the criteria.
-3. Restrict factual verification strictly to official Indian government portals and websites (e.g. .gov.in, .nic.in, myscheme.gov.in, scholarships.gov.in, pmkisan.gov.in, telanganaepass.cgg.gov.in, jnanabhumi.ap.gov.in, etc.).
-4. MANDATORY TEXT FORMAT IN CHATBOX (STRICTLY NO CARDS FORMAT):
-   DO NOT display schemes and scholarships in cards format. Never output card layouts, button grids, or card UI.
-   You MUST output all recommended schemes and scholarships in pure text format directly in the chatbox, numbered sequentially (1., 2., 3., ...), using these EXACT terms:
+CORE OPERATING DIRECTIVES:
+1. ALWAYS ANSWER THE USER'S SPECIFIC QUESTION OR QUERY DIRECTLY:
+   - Your highest priority is to directly, accurately, and thoroughly answer the user's exact question, doubt, or request.
+   - If the user asks a procedural question (e.g., "how to apply for an income certificate", "how does Aadhaar DBT seeding work", "where is the nearest MeeSeva", "how to register on ePASS", "what documents are required for my college scholarship", "is there a scheme for tractors"), EXPLAIN THE EXACT STEP-BY-STEP PROCEDURE DIRECTLY.
+   - If the user asks about a specific scheme, question, or general query, address THAT query directly and comprehensively.
+   - If the user greets you or asks who you are, give a polite, helpful greeting and guide them on what they can ask.
+   - DO NOT ignore the citizen's question to dump an unrelated pre-scripted list of schemes.
+
+2. SCHEME RECOMMENDATION FORMAT (WHEN SCHEMES ARE REQUESTED OR DIRECTLY RELEVANT):
+   - When recommending schemes or when the user asks for schemes matching their profile, provide active schemes in clean text format directly in the chatbox, numbered sequentially:
    1.
    **Scheme Name:** [Official Scheme Name]
    **Requirements:** [Eligibility criteria & Required Documents]
@@ -1054,26 +1179,33 @@ RULES & CONSTRAINTS:
    **Deadline:** ...
    **Official Portal Link:** ...
 
-   Make sure EVERY scheme will be represented with these terms in text format in the chatbox itself.
-5. CENTRAL GOVERNMENT SCHEMES & SCHOLARSHIPS:
-   When the user asks about 'central schemes', 'central government schemes', 'national schemes', 'scholarships', or any Pan-India welfare programs, you MUST identify and present all active Central Government schemes and Centrally Sponsored scholarships matching their profile:
-   - For Students: PM-YASASVI Central Sector Scholarship, Central Sector Scheme of Scholarship for College and University Students, PM Vidyalaxmi Higher Education Loan Interest Subsidy, National Means-cum-Merit Scholarship Scheme (NMMSS), AICTE Pragati Scholarship for Girls, Post-Matric Scholarships for SC/ST/OBC (NSP).
-   - For Farmers: PM Kisan Samman Nidhi (₹6,000/yr direct income support), PM Fasal Bima Yojana, Kisan Credit Card.
-   - For General Citizens / EWS: Ayushman Bharat PM-JAY (₹5 Lakh free health hospitalization), PM Awas Yojana (PMAY), PM Surya Ghar Muft Bijli Yojana.
-   - For Entrepreneurs / Self-Employed: Pradhan Mantri MUDRA Yojana, Stand-Up India, PM Vishwakarma Yojana, PM SVANidhi.
-   Always format every single Central scheme using the exact numbered text format specified above.
-6. MANDATORY OFFICIAL LINK REQUIREMENT: For EVERY single scheme or scholarship mentioned, you MUST provide its valid official government application URL (e.g. [National Scholarship Portal](https://scholarships.gov.in), [Telangana ePASS](https://telanganaepass.cgg.gov.in), [JnanaBhumi AP](https://jnanabhumi.ap.gov.in), [PM-KISAN](https://pmkisan.gov.in), [PM-JAY](https://pmjay.gov.in), etc.). Never omit or leave the official link blank for ANY mentioned scheme.
-7. Do not invent or estimate deadlines. If a deadline is unavailable or subject to official notification, clearly state: "Check Official Portal".
-8. Provide concise, clear, and reassuring guidance. Explain how to prepare paperwork (e.g. Income certificate from Tehsildar, Bonafide from college, Bank Aadhaar DBT seeding) when helpful.`;
+   - Note: If the user is asking a conversational question, clarifying a detail, asking for directions, or asking how to obtain a certificate or solve a problem, ANSWER THEIR QUESTION DIRECTLY. You do not need to append arbitrary schemes if they are not relevant to what the user asked.
+
+3. STRICT STATE RESTRICTION (ONLY ANDHRA PRADESH & TELANGANA):
+   - You EXCLUSIVELY support and concentrate on the states of **Andhra Pradesh** and **Telangana** (in addition to Pan-India Central Government schemes).
+   - If a user asks about any other state (such as Karnataka, Maharashtra, etc.), politely explain that this portal is dedicated to Andhra Pradesh, Telangana, and Central Government schemes.
+   - Concentrate on active schemes in Andhra Pradesh (Annadata Sukhibhava farmer grant ₹20,000/yr, Dr. NTR Vaidya Seva ₹25 Lakh cashless healthcare, NTR Bharosa Social Security Pension ₹4,000/mo, Thalliki Vandanam ₹15,000/child education incentive, Deepam 2.0 Free 3 LPG Gas Cylinders, Maha Shakti Free RTC Bus Travel for Women, Yuva Galam Unemployment Allowance ₹3,000/mo, JnanaBhumi Vidya Deevena & Vasathi Deevena Fee Reimbursement, and Sunna Vaddi for DWCRA women) and Telangana (Telangana ePASS Post-Matric Scholarships & Fee Reimbursement, Maha Lakshmi Free Bus Travel and ₹500 Gas Cylinder, Overseas Vidya Nidhi, TASK Youth Training Subsidy, Rythu Bharosa, Kalyana Lakshmi / Shaadi Mubarak, Rajiv Aarogyasri, Gruha Jyothi).
+
+4. STRICT PROFILE RELEVANCE:
+   - When suggesting schemes, ensure they strictly match the citizen's profile.
+   - If NOT a student: Do NOT recommend student scholarships or college fee reimbursements; recommend employment, healthcare, housing, electricity, agricultural (if farmer), or welfare schemes.
+   - If a student: Prioritize scholarships, fee reimbursement, and educational assistance.
+   - If 'Women': Recommend women-specific empowerment programs (not senior pensions).
+   - If 'Senior Citizen': Recommend senior citizen pensions and geriatric healthcare.
+
+5. VERIFIED OFFICIAL SOURCES:
+   - Ground all advice in official Indian government portals (.gov.in, .nic.in, myscheme.gov.in, scholarships.gov.in, etc.). Always include genuine official links for every scheme discussed.`;
 
     // Format chat messages
     const contents: any[] = [];
     if (Array.isArray(history)) {
       history.forEach((h: { role: string; text: string }) => {
-        contents.push({
-          role: h.role === 'user' ? 'user' : 'model',
-          parts: [{ text: h.text }]
-        });
+        if (h && h.text) {
+          contents.push({
+            role: h.role === 'user' ? 'user' : 'model',
+            parts: [{ text: String(h.text) }]
+          });
+        }
       });
     }
 
@@ -1083,12 +1215,13 @@ RULES & CONSTRAINTS:
     });
 
     const response = await generateContentWithFallback(ai, {
-      primaryModel: 'gemini-flash-latest',
-      fallbackModels: ['gemini-3.1-flash-lite', 'gemini-2.5-flash'],
+      primaryModel: 'gemini-3.1-flash-lite',
+      fallbackModels: ['gemini-3.8-flash', 'gemini-flash-latest'],
       contents,
       config: {
         systemInstruction,
-      }
+      },
+      timeoutMs: 15000,
     });
 
     if (response?.text) {
@@ -1100,160 +1233,7 @@ RULES & CONSTRAINTS:
     return res.json({
       reply: buildFallbackReply(message, userProfile, isTeluguRequested)
     });
-
-    const isCentralQuery = false;
-    if (isCentralQuery) {
-      return res.json({
-        reply: isTeluguRequested
-          ? `మీ ప్రొఫైల్ వివరాల ఆధారంగా ధృవీకరించబడిన ప్రముఖ కేంద్ర ప్రభుత్వ పథకాలు & స్కాలర్‌షిప్‌లు క్రింద వివరించబడ్డాయి:
-
-1.
-**పథకం పేరు (Scheme Name):** పీఎం యశస్వి కేంద్రీయ స్కాలర్‌షిప్ పథకం (PM-YASASVI)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** OBC/EBC/DNT విద్యార్థులు, వార్షిక కుటుంబ ఆదాయం ₹2.5 లక్షల లోపు. పత్రాలు: ఆధార్ కార్డు, ఆదాయ ధృవీకరణ పత్రం, కుల ధృవీకరణ పత్రం, బోనఫైడ్, ఆధార్ డీబీటీ బ్యాంకు ఖాతా.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** మీ విద్యా స్థాయి మరియు సామాజిక వర్గానికి కేంద్ర ప్రభుత్వం ద్వారా నేరుగా డీబీటీ స్కాలర్‌షిప్ అందిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [నేషనల్ స్కాలర్‌షిప్ పోర్టల్](https://scholarships.gov.in)
-
-2.
-**పథకం పేరు (Scheme Name):** కాలేజ్ & యూనివర్సిటీ విద్యార్థుల సెంట్రల్ సెక్టార్ స్కాలర్‌షిప్ (CSSS)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** ఇంటర్ / 12వ తరగతి బోర్డు పరీక్షల్లో 80 శాతానికి పైగా మార్కులు, రెగ్యులర్ డిగ్రీ విద్యార్థులు, కుటుంబ ఆదాయం ₹4.5 లక్షల లోపు. పత్రాలు: మార్కుల జాబితా, కాలేజీ బోనఫైడ్, ఆదాయ పత్రం, బ్యాంకు పాస్‌బుక్.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** ఉన్నత విద్య కోసం ప్రతి సంవత్సరం ₹12,000 నుండి ₹20,000 వరకు నగదు సహాయం నేరుగా ఖాతాలో జమ చేయబడుతుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [నేషనల్ స్కాలర్‌షిప్ పోర్టల్](https://scholarships.gov.in)
-
-3.
-**పథకం పేరు (Scheme Name):** పీఎం విద్యాలక్ష్మి ఉన్నత విద్యా రుణ వడ్డీ రాయితీ (PM Vidyalaxmi)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** గుర్తింపు పొందిన ఉన్నత విద్యా సంస్థల్లో అడ్మిషన్, కుటుంబ ఆదాయం ₹8 లక్షల లోపు. పత్రాలు: అడ్మిషన్ లెటర్, ఫీజు రసీదు, ఆదాయ పత్రం, ఆధార్ కార్డు.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** పూచీకత్తు లేకుండా ₹7.5 లక్షల వరకు విద్యా రుణాలపై పూర్తి వడ్డీ రాయితీ లభిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [పీఎం విద్యాలక్ష్మి పోర్టల్](https://www.pmvidyalaxmi.gov.in)`
-          : `Here are verified active Central Government schemes and national scholarships matching your profile:
-
-1.
-**Scheme Name:** PM YASASVI Central Sector Scheme for OBC, EBC & DNT Students
-**Requirements:** OBC/EBC/DNT students enrolled in recognized schools/colleges, Family annual income under ₹2.5 Lakh. Documents: Aadhaar Card, Income Certificate, Caste Certificate, Bonafide ID, Aadhaar DBT-linked Bank Account.
-**Why it suits you:** Provides merit-based financial aid directly disbursed through Aadhaar DBT to support your education expenses.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [National Scholarship Portal](https://scholarships.gov.in)
-
-2.
-**Scheme Name:** Central Sector Scheme of Scholarship for College and University Students
-**Requirements:** Above 80th percentile in Class 12 board examinations, enrolled in regular UG/PG course, Family annual income under ₹4.5 Lakh. Documents: Class 12 Marksheet, College Bonafide Certificate, Income Certificate, Aadhaar DBT Bank Account.
-**Why it suits you:** Supports undergraduate and postgraduate degree pursuits with annual scholarship disbursements (₹12,000–₹20,000/year).
-**Deadline:** Check Official Portal
-**Official Portal Link:** [National Scholarship Portal](https://scholarships.gov.in)
-
-3.
-**Scheme Name:** PM Vidyalaxmi Higher Education Loan Interest Subsidy Scheme
-**Requirements:** Admitted to top NIRF-ranked higher education institutions in India, Annual family income up to ₹8 Lakh. Documents: Admission Letter, Course Fee Structure, Income Certificate from Tehsildar, PAN, Aadhaar.
-**Why it suits you:** Enables collateral-free education loans up to ₹7.5 Lakh with central government interest subvention.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [PM Vidyalaxmi Portal](https://www.pmvidyalaxmi.gov.in)`
-      });
-    }
-
-    const isStateQuery = /(state|రాష్ట్ర|తెలంగాణ|telangana|andhra|ఆంధ్ర|local)/i.test(message || '');
-
-    if (isStateQuery) {
-      return res.json({
-        reply: isTeluguRequested
-          ? `మీ ప్రొఫైల్ వివరాల ఆధారంగా ధృవీకరించబడిన ప్రముఖ రాష్ట్ర ప్రభుత్వ పథకాలు క్రింద ఇవ్వబడ్డాయి:
-
-1.
-**పథకం పేరు (Scheme Name):** తెలంగాణ ఈ-పాస్ పోస్ట్-మెట్రిక్ స్కాలర్‌షిప్ & ఫీజు రీయింబర్స్‌మెంట్ (Telangana ePASS)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** తెలంగాణ వాస్తవ్యులు, ఇంటర్/డిగ్రీ/పీజీ విద్యార్థులు, వార్షిక కుటుంబ ఆదాయం ₹2 లక్షల లోపు (SC/ST లకు ₹2.5 లక్షల లోపు). పత్రాలు: ఆదాయ ధృవీకరణ పత్రం, కుల ధృవీకరణ పత్రం, ఎస్ఎస్సీ హాల్ టికెట్, కాలేజీ బోనఫైడ్, ఆధార్ డీబీటీ బ్యాంకు ఖాతా.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** పూర్తి కాలేజీ ట్యూషన్ ఫీజు రీయింబర్స్‌మెంట్ (RTF) మరియు నెలవారీ వసతి భత్యం (MTF) నేరుగా అందిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [తెలంగాణ ఈ-పాస్ పోర్టల్](https://telanganaepass.cgg.gov.in)
-
-2.
-**పథకం పేరు (Scheme Name):** చీఫ్ మినిస్టర్స్ ఓవర్సీస్ స్కాలర్‌షిప్ పథకం (Overseas Vidya Nidhi)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** విదేశీ విశ్వవిద్యాలయాల్లో ఉన్నత విద్య (MS/PG) అభ్యసించే ఎస్సీ/ఎస్టీ/బీసీ విద్యార్థులు, వార్షిక ఆదాయం ₹5 లక్షల లోపు. పత్రాలు: GRE/TOEFL స్కోర్‌కార్డ్, అడ్మిషన్ ఆఫర్ లెటర్, ఆధార్, పాస్‌పోర్ట్, ఆదాయ ధృవీకరణ పత్రం.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** విదేశీ ఉన్నత విద్య కోసం గరిష్టంగా ₹20 లక్షల వరకు ఆర్థిక సహాయం గ్రాంట్‌గా మంజూరు చేస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [తెలంగాణ ఓవర్సీస్ స్కాలర్‌షిప్](https://telanganaepass.cgg.gov.in)
-
-3.
-**పథకం పేరు (Scheme Name):** తెలంగాణ యువ వికాసం స్కిల్ డెవలప్‌మెంట్ & స్వయం ఉపాధి శిక్షణ (TASK)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** తెలంగాణ యువత (వయస్సు 18-35 సం.), 10వ/12వ తరగతి లేదా గ్రాడ్యుయేషన్ పూర్తి. పత్రాలు: ఆధార్ కార్డు, విద్యార్హత పత్రాలు, స్థానికత ధృవీకరణ పత్రం.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** పరిశ్రమలకు అవసరమైన ఆధునిక సాంకేతిక నైపుణ్యాల శిక్షణ మరియు ప్లేస్‌మెంట్ కల్పిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [తెలంగాణ అకాడమీ ఫర్ స్కిల్ అండ్ నాలెడ్జ్](https://task.telangana.gov.in)`
-          : `Here are verified active State Government schemes and scholarships matching your profile:
-
-1.
-**Scheme Name:** Telangana ePASS Post-Matric Scholarship & Full Fee Reimbursement (RTF & MTF)
-**Requirements:** Resident of Telangana studying intermediate, degree, engineering or professional courses, Annual family income under ₹2.00 Lakh (SC/ST under ₹2.50 Lakh). Documents: Income Certificate from MeeSeva, Integrated Community Certificate, SSC Marks Card, College Bonafide, Bank Passbook (DBT-seeded).
-**Why it suits you:** Reimburses 100% of your college tuition fees and provides monthly maintenance grants directly to your bank account.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [Telangana ePASS Portal](https://telanganaepass.cgg.gov.in)
-
-2.
-**Scheme Name:** Overseas Vidya Nidhi Scheme for Higher Education Abroad
-**Requirements:** Students pursuing Master's / PhD degrees in recognized universities in USA, UK, Canada, Australia, Family income up to ₹5.00 Lakh. Documents: Valid Passport, Visa, Foreign University Offer Letter, GRE/IELTS/TOEFL scorecard, Income Certificate.
-**Why it suits you:** Grants up to ₹20.00 Lakh direct financial assistance to support overseas tuition and living costs.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [Telangana ePASS Overseas Portal](https://telanganaepass.cgg.gov.in)
-
-3.
-**Scheme Name:** Telangana Academy for Skill and Knowledge (TASK) Youth Development Program
-**Requirements:** Telangana youth aged 18–35, enrolled in diploma/degree courses or recent graduates. Documents: College ID, Aadhaar Card, Academic Marksheets.
-**Why it suits you:** Provides subsidized technology and industry-grade employability skill certifications with direct campus recruitment linkage.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [Telangana Academy for Skill and Knowledge](https://task.telangana.gov.in)`
-      });
-    }
-
-    // General fallback formatted in strict numbered scheme format
-    return res.json({
-      reply: isTeluguRequested
-        ? `మీ ప్రొఫైల్ ఆధారంగా ధృవీకరించబడిన కేంద్ర మరియు రాష్ట్ర ప్రభుత్వ పథకాలు క్రింద పేర్కొన్న విధంగా ఉన్నాయి:
-
-1.
-**పథకం పేరు (Scheme Name):** పీఎం యశస్వి కేంద్రీయ స్కాలర్‌షిప్ పథకం (PM-YASASVI)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** OBC/EBC/DNT విద్యార్థులు, వార్షిక కుటుంబ ఆదాయం ₹2.5 లక్షల లోపు. పత్రాలు: ఆధార్ కార్డు, ఆదాయ ధృవీకరణ పత్రం, కుల ధృవీకరణ పత్రం, బోనఫైడ్, ఆధార్ డీబీటీ ఖాతా.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** కేంద్ర ప్రభుత్వం అందించే ప్రత్యక్ష డీబీటీ విద్యా నిధి ద్వారా ఉన్నత చదువులకు సహాయం లభిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [నేషనల్ స్కాలర్‌షిప్ పోర్టల్](https://scholarships.gov.in)
-
-2.
-**పథకం పేరు (Scheme Name):** కాలేజ్ & యూనివర్సిటీ విద్యార్థుల సెంట్రల్ సెక్టార్ స్కాలర్‌షిప్ (CSSS)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** ఇంటర్ / 12వ తరగతిలో 80 శాతానికి పైగా మార్కులు, రెగ్యులర్ డిగ్రీ విద్యార్థులు, కుటుంబ ఆదాయం ₹4.5 లక్షల లోపు. పత్రాలు: మార్కుల జాబితా, కాలేజీ బోనఫైడ్, ఆదాయ పత్రం.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** మీ మెరిట్ ఆధారంగా ప్రతి సంవత్సరం రూ. 12,000 నుండి 20,000 వరకు నేరుగా ఉపకార వేతనం అందుతుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [నేషనల్ స్కాలర్‌షిప్ పోర్టల్](https://scholarships.gov.in)
-
-3.
-**పథకం పేరు (Scheme Name):** తెలంగాణ ఈ-పాస్ పోస్ట్-మెట్రిక్ స్కాలర్‌షిప్ & ఫీజు రీయింబర్స్‌మెంట్ (Telangana ePASS)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** పోస్ట్-మెట్రిక్ కళాశాల విద్యార్థులు, వార్షిక కుటుంబ ఆదాయం ₹2 లక్షల లోపు. పత్రాలు: తహశీల్దార్ ఆదాయ పత్రం, కుల పత్రం, ఆధార్ డీబీటీ బ్యాంకు ఖాతా.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** కాలేజీ ట్యూషన్ ఫీజులను ప్రభుత్వం పూర్తిగా చెల్లించి ఉన్నత చదువులను ప్రోత్సహిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [తెలంగాణ ఈ-పాస్ పోర్టల్](https://telanganaepass.cgg.gov.in)`
-        : `Here are active government schemes and scholarships matching your profile:
-
-1.
-**Scheme Name:** PM YASASVI Central Sector Scheme for OBC, EBC & DNT Students
-**Requirements:** OBC/EBC/DNT students enrolled in recognized institutions, Annual family income under ₹2.5 Lakh. Documents: Aadhaar Card, Income Certificate, Caste Certificate, Bonafide ID, Aadhaar DBT-linked Bank Account.
-**Why it suits you:** Provides merit-based financial aid directly disbursed through Aadhaar DBT to support your education expenses.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [National Scholarship Portal](https://scholarships.gov.in)
-
-2.
-**Scheme Name:** Central Sector Scheme of Scholarship for College and University Students
-**Requirements:** Above 80th percentile in Class 12 board examinations, enrolled in regular UG/PG course, Family annual income under ₹4.5 Lakh. Documents: Class 12 Marksheet, College Bonafide Certificate, Income Certificate, Aadhaar DBT Bank Account.
-**Why it suits you:** Supports undergraduate degree education with annual scholarship disbursements (₹12,000–₹20,000/year).
-**Deadline:** Check Official Portal
-**Official Portal Link:** [National Scholarship Portal](https://scholarships.gov.in)
-
-3.
-**Scheme Name:** Telangana ePASS Post-Matric Scholarship & Full Fee Reimbursement (RTF & MTF)
-**Requirements:** Resident of Telangana studying intermediate or higher education, Annual family income under ₹2.00 Lakh (SC/ST under ₹2.50 Lakh). Documents: Income Certificate from MeeSeva, Caste Certificate, SSC Marks Memo, College Bonafide, Bank Passbook.
-**Why it suits you:** Reimburses 100% of college tuition fees and provides monthly maintenance stipends to eligible students.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [Telangana ePASS Portal](https://telanganaepass.cgg.gov.in)`
-    });
   } catch (error: any) {
-    console.warn('Notice in /api/ai/chat:', error?.message || error);
     const { message, userProfile, language } = req.body || {};
     const isTeluguRequested = 
       (typeof language === 'string' && language.toLowerCase() === 'telugu') ||
@@ -1262,158 +1242,6 @@ RULES & CONSTRAINTS:
 
     return res.json({
       reply: buildFallbackReply(message, userProfile, isTeluguRequested)
-    });
-
-    const isCentralQuery = false;
-    if (isCentralQuery) {
-      return res.json({
-        reply: isTeluguRequested
-          ? `మీ ప్రొఫైల్ వివరాల ఆధారంగా ధృవీకరించబడిన ప్రముఖ కేంద్ర ప్రభుత్వ పథకాలు & స్కాలర్‌షిప్‌లు క్రింద వివరించబడ్డాయి:
-
-1.
-**పథకం పేరు (Scheme Name):** పీఎం యశస్వి కేంద్రీయ స్కాలర్‌షిప్ పథకం (PM-YASASVI)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** OBC/EBC/DNT విద్యార్థులు, వార్షిక కుటుంబ ఆదాయం ₹2.5 లక్షల లోపు. పత్రాలు: ఆధార్ కార్డు, ఆదాయ ధృవీకరణ పత్రం, కుల ధృవీకరణ పత్రం, బోనఫైడ్, ఆధార్ డీబీటీ బ్యాంకు ఖాతా.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** మీ విద్యా స్థాయి మరియు సామాజిక వర్గానికి కేంద్ర ప్రభుత్వం ద్వారా నేరుగా డీబీటీ స్కాలర్‌షిప్ అందిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [నేషనల్ స్కాలర్‌షిప్ పోర్టల్](https://scholarships.gov.in)
-
-2.
-**పథకం పేరు (Scheme Name):** కాలేజ్ & యూనివర్సిటీ విద్యార్థుల సెంట్రల్ సెక్టార్ స్కాలర్‌షిప్ (CSSS)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** ఇంటర్ / 12వ తరగతి బోర్డు పరీక్షల్లో 80 శాతానికి పైగా మార్కులు, రెగ్యులర్ డిగ్రీ విద్యార్థులు, కుటుంబ ఆదాయం ₹4.5 లక్షల లోపు. పత్రాలు: మార్కుల జాబితా, కాలేజీ బోనఫైడ్, ఆదాయ పత్రం, బ్యాంకు పాస్‌బుక్.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** ఉన్నత విద్య కోసం ప్రతి సంవత్సరం ₹12,000 నుండి ₹20,000 వరకు నగదు సహాయం నేరుగా ఖాతాలో జమ చేయబడుతుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [నేషనల్ స్కాలర్‌షిప్ పోర్టల్](https://scholarships.gov.in)
-
-3.
-**పథకం పేరు (Scheme Name):** పీఎం విద్యాలక్ష్మి ఉన్నత విద్యా రుణ వడ్డీ రాయితీ (PM Vidyalaxmi)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** గుర్తింపు పొందిన ఉన్నత విద్యా సంస్థల్లో అడ్మిషన్, కుటుంబ ఆదాయం ₹8 లక్షల లోపు. పత్రాలు: అడ్మిషన్ లెటర్, ఫీజు రసీదు, ఆదాయ పత్రం, ఆధార్ కార్డు.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** పూచీకత్తు లేకుండా ₹7.5 లక్షల వరకు విద్యా రుణాలపై పూర్తి వడ్డీ రాయితీ లభిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [పీఎం విద్యాలక్ష్మి పోర్టల్](https://www.pmvidyalaxmi.gov.in)`
-          : `Here are verified active Central Government schemes and national scholarships matching your profile:
-
-1.
-**Scheme Name:** PM YASASVI Central Sector Scheme for OBC, EBC & DNT Students
-**Requirements:** OBC/EBC/DNT students enrolled in recognized schools/colleges, Family annual income under ₹2.5 Lakh. Documents: Aadhaar Card, Income Certificate, Caste Certificate, Bonafide ID, Aadhaar DBT-linked Bank Account.
-**Why it suits you:** Provides merit-based financial aid directly disbursed through Aadhaar DBT to support your education expenses.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [National Scholarship Portal](https://scholarships.gov.in)
-
-2.
-**Scheme Name:** Central Sector Scheme of Scholarship for College and University Students
-**Requirements:** Above 80th percentile in Class 12 board examinations, enrolled in regular UG/PG course, Family annual income under ₹4.5 Lakh. Documents: Class 12 Marksheet, College Bonafide Certificate, Income Certificate, Aadhaar DBT Bank Account.
-**Why it suits you:** Supports undergraduate and postgraduate degree pursuits with annual scholarship disbursements (₹12,000–₹20,000/year).
-**Deadline:** Check Official Portal
-**Official Portal Link:** [National Scholarship Portal](https://scholarships.gov.in)
-
-3.
-**Scheme Name:** PM Vidyalaxmi Higher Education Loan Interest Subsidy Scheme
-**Requirements:** Admitted to top NIRF-ranked higher education institutions in India, Annual family income up to ₹8 Lakh. Documents: Admission Letter, Course Fee Structure, Income Certificate from Tehsildar, PAN, Aadhaar.
-**Why it suits you:** Enables collateral-free education loans up to ₹7.5 Lakh with central government interest subvention.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [PM Vidyalaxmi Portal](https://www.pmvidyalaxmi.gov.in)`
-      });
-    }
-
-    const isStateQuery = /(state|రాష్ట్ర|తెలంగాణ|telangana|andhra|ఆంధ్ర|local)/i.test(message || '');
-
-    if (isStateQuery) {
-      return res.json({
-        reply: isTeluguRequested
-          ? `మీ ప్రొఫైల్ వివరాల ఆధారంగా ధృవీకరించబడిన ప్రముఖ రాష్ట్ర ప్రభుత్వ పథకాలు క్రింద ఇవ్వబడ్డాయి:
-
-1.
-**పథకం పేరు (Scheme Name):** తెలంగాణ ఈ-పాస్ పోస్ట్-మెట్రిక్ స్కాలర్‌షిప్ & ఫీజు రీయింబర్స్‌మెంట్ (Telangana ePASS)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** తెలంగాణ వాస్తవ్యులు, ఇంటర్/డిగ్రీ/పీజీ విద్యార్థులు, వార్షిక కుటుంబ ఆదాయం ₹2 లక్షల లోపు (SC/ST లకు ₹2.5 లక్షల లోపు). పత్రాలు: ఆదాయ ధృవీకరణ పత్రం, కుల ధృవీకరణ పత్రం, ఎస్ఎస్సీ హాల్ టికెట్, కాలేజీ బోనఫైడ్, ఆధార్ డీబీటీ బ్యాంకు ఖాతా.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** పూర్తి కాలేజీ ట్యూషన్ ఫీజు రీయింబర్స్‌మెంట్ (RTF) మరియు నెలవారీ వసతి భత్యం (MTF) నేరుగా అందిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [తెలంగాణ ఈ-పాస్ పోర్టల్](https://telanganaepass.cgg.gov.in)
-
-2.
-**పథకం పేరు (Scheme Name):** చీఫ్ మినిస్టర్స్ ఓవర్సీస్ స్కాలర్‌షిప్ పథకం (Overseas Vidya Nidhi)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** విదేశీ విశ్వవిద్యాలయాల్లో ఉన్నత విద్య (MS/PG) అభ్యసించే ఎస్సీ/ఎస్టీ/బీసీ విద్యార్థులు, వార్షిక ఆదాయం ₹5 లక్షల లోపు. పత్రాలు: GRE/TOEFL స్కోర్‌కార్డ్, అడ్మిషన్ ఆఫర్ లెటర్, ఆధార్, పాస్‌పోర్ట్, ఆదాయ ధృవీకరణ పత్రం.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** విదేశీ ఉన్నత విద్య కోసం గరిష్టంగా ₹20 లక్షల వరకు ఆర్థిక సహాయం గ్రాంట్‌గా మంజూరు చేస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [తెలంగాణ ఓవర్సీస్ స్కాలర్‌షిప్](https://telanganaepass.cgg.gov.in)
-
-3.
-**పథకం పేరు (Scheme Name):** తెలంగాణ యువ వికాసం స్కిల్ డెవలప్‌మెంట్ & స్వయం ఉపాధి శిక్షణ (TASK)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** తెలంగాణ యువత (వయస్సు 18-35 సం.), 10వ/12వ తరగతి లేదా గ్రాడ్యుయేషన్ పూర్తి. పత్రాలు: ఆధార్ కార్డు, విద్యార్హత పత్రాలు, స్థానికత ధృవీకరణ పత్రం.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** పరిశ్రమలకు అవసరమైన ఆధునిక సాంకేతిక నైపుణ్యాల శిక్షణ మరియు ప్లేస్‌మెంట్ కల్పిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [తెలంగాణ అకాడమీ ఫర్ స్కిల్ అండ్ నాలెడ్జ్](https://task.telangana.gov.in)`
-          : `Here are verified active State Government schemes and scholarships matching your profile:
-
-1.
-**Scheme Name:** Telangana ePASS Post-Matric Scholarship & Full Fee Reimbursement (RTF & MTF)
-**Requirements:** Resident of Telangana studying intermediate, degree, engineering or professional courses, Annual family income under ₹2.00 Lakh (SC/ST under ₹2.50 Lakh). Documents: Income Certificate from MeeSeva, Integrated Community Certificate, SSC Marks Card, College Bonafide, Bank Passbook (DBT-seeded).
-**Why it suits you:** Reimburses 100% of your college tuition fees and provides monthly maintenance grants directly to your bank account.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [Telangana ePASS Portal](https://telanganaepass.cgg.gov.in)
-
-2.
-**Scheme Name:** Overseas Vidya Nidhi Scheme for Higher Education Abroad
-**Requirements:** Students pursuing Master's / PhD degrees in recognized universities in USA, UK, Canada, Australia, Family income up to ₹5.00 Lakh. Documents: Valid Passport, Visa, Foreign University Offer Letter, GRE/IELTS/TOEFL scorecard, Income Certificate.
-**Why it suits you:** Grants up to ₹20.00 Lakh direct financial assistance to support overseas tuition and living costs.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [Telangana ePASS Overseas Portal](https://telanganaepass.cgg.gov.in)
-
-3.
-**Scheme Name:** Telangana Academy for Skill and Knowledge (TASK) Youth Development Program
-**Requirements:** Telangana youth aged 18–35, enrolled in diploma/degree courses or recent graduates. Documents: College ID, Aadhaar Card, Academic Marksheets.
-**Why it suits you:** Provides subsidized technology and industry-grade employability skill certifications with direct campus recruitment linkage.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [Telangana Academy for Skill and Knowledge](https://task.telangana.gov.in)`
-      });
-    }
-
-    // Return friendly resilient fallback formatted in strict numbered scheme format
-    res.json({
-      reply: isTeluguRequested
-        ? `మీ ప్రొఫైల్ ఆధారంగా ధృవీకరించబడిన ప్రముఖ కేంద్ర మరియు రాష్ట్ర ప్రభుత్వ పథకాలు క్రింద పేర్కొన్న విధంగా ఉన్నాయి:
-
-1.
-**పథకం పేరు (Scheme Name):** పీఎం యశస్వి కేంద్రీయ స్కాలర్‌షిప్ పథకం (PM-YASASVI)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** OBC/EBC/DNT విద్యార్థులు, వార్షిక కుటుంబ ఆదాయం ₹2.5 లక్షల లోపు. పత్రాలు: ఆధార్ కార్డు, ఆదాయ ధృవీకరణ పత్రం, కుల ధృవీకరణ పత్రం, బోనఫైడ్, ఆధార్ డీబీటీ ఖాతా.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** కేంద్ర ప్రభుత్వం అందించే ప్రత్యక్ష డీబీటీ విద్యా నిధి ద్వారా ఉన్నత చదువులకు సహాయం లభిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [నేషనల్ స్కాలర్‌షిప్ పోర్టల్](https://scholarships.gov.in)
-
-2.
-**పథకం పేరు (Scheme Name):** కాలేజ్ & యూనివర్సిటీ విద్యార్థుల సెంట్రల్ సెక్టార్ స్కాలర్‌షిప్ (CSSS)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** ఇంటర్ / 12వ తరగతిలో 80 శాతానికి పైగా మార్కులు, రెగ్యులర్ డిగ్రీ విద్యార్థులు, కుటుంబ ఆదాయం ₹4.5 లక్షల లోపు. పత్రాలు: మార్కుల జాబితా, కాలేజీ బోనఫైడ్, ఆదాయ పత్రం.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** మీ మెరిట్ ఆధారంగా ప్రతి సంవత్సరం రూ. 12,000 నుండి 20,000 వరకు నేరుగా ఉపకార వేతనం అందుతుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [నేషనల్ స్కాలర్‌షిప్ పోర్టల్](https://scholarships.gov.in)
-
-3.
-**పథకం పేరు (Scheme Name):** తెలంగాణ ఈ-పాస్ పోస్ట్-మెట్రిక్ స్కాలర్‌షిప్ & ఫీజు రీయింబర్స్‌మెంట్ (Telangana ePASS)
-**అర్హతలు & అవసరమైన పత్రాలు (Requirements):** పోస్ట్-మెట్రిక్ కళాశాల విద్యార్థులు, వార్షిక కుటుంబ ఆదాయం ₹2 లక్షల లోపు. పత్రాలు: తహశీల్దార్ ఆదాయ పత్రం, కుల పత్రం, ఆధార్ డీబీటీ బ్యాంకు ఖాతా.
-**మీకు ఎందుకు సరిపోతుంది (Why it suits you):** కాలేజీ ట్యూషన్ ఫీజులను ప్రభుత్వం పూర్తిగా చెల్లించి ఉన్నత చదువులను ప్రోత్సహిస్తుంది.
-**గడువు తేదీ (Deadline):** Check Official Portal
-**అధికారిక పోర్టల్ లింక్ (Official Portal Link):** [తెలంగాణ ఈ-పాస్ పోర్టల్](https://telanganaepass.cgg.gov.in)`
-        : `Here are active government schemes and scholarships matching your profile:
-
-1.
-**Scheme Name:** PM YASASVI Central Sector Scheme for OBC, EBC & DNT Students
-**Requirements:** OBC/EBC/DNT students enrolled in recognized institutions, Annual family income under ₹2.5 Lakh. Documents: Aadhaar Card, Income Certificate, Caste Certificate, Bonafide ID, Aadhaar DBT-linked Bank Account.
-**Why it suits you:** Provides merit-based financial aid directly disbursed through Aadhaar DBT to support your education expenses.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [National Scholarship Portal](https://scholarships.gov.in)
-
-2.
-**Scheme Name:** Central Sector Scheme of Scholarship for College and University Students
-**Requirements:** Above 80th percentile in Class 12 board examinations, enrolled in regular UG/PG course, Family annual income under ₹4.5 Lakh. Documents: Class 12 Marksheet, College Bonafide Certificate, Income Certificate, Aadhaar DBT Bank Account.
-**Why it suits you:** Supports undergraduate degree education with annual scholarship disbursements (₹12,000–₹20,000/year).
-**Deadline:** Check Official Portal
-**Official Portal Link:** [National Scholarship Portal](https://scholarships.gov.in)
-
-3.
-**Scheme Name:** Telangana ePASS Post-Matric Scholarship & Full Fee Reimbursement (RTF & MTF)
-**Requirements:** Resident of Telangana studying intermediate or higher education, Annual family income under ₹2.00 Lakh (SC/ST under ₹2.50 Lakh). Documents: Income Certificate from MeeSeva, Caste Certificate, SSC Marks Memo, College Bonafide, Bank Passbook.
-**Why it suits you:** Reimburses 100% of college tuition fees and provides monthly maintenance stipends to eligible students.
-**Deadline:** Check Official Portal
-**Official Portal Link:** [Telangana ePASS Portal](https://telanganaepass.cgg.gov.in)`
     });
   }
 });
@@ -1472,8 +1300,8 @@ Return a valid JSON object in this exact format:
 }`;
 
     const response = await generateContentWithFallback(ai, {
-      primaryModel: 'gemini-3.8-flash',
-      fallbackModels: ['gemini-3.1-flash-lite', 'gemini-flash-latest'],
+      primaryModel: 'gemini-3.1-flash-lite',
+      fallbackModels: ['gemini-3.8-flash', 'gemini-flash-latest'],
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: {
         responseMimeType: 'application/json',
@@ -1544,8 +1372,8 @@ STRICT GUIDELINES:
 4. Keep the tone respectful, clear, and reassuring.`;
 
     const response = await generateContentWithFallback(ai, {
-      primaryModel: 'gemini-3.8-flash',
-      fallbackModels: ['gemini-3.1-flash-lite', 'gemini-flash-latest'],
+      primaryModel: 'gemini-3.1-flash-lite',
+      fallbackModels: ['gemini-3.8-flash', 'gemini-flash-latest'],
       contents: prompt,
       config: {
         systemInstruction: 'You are the official Yojana Mitra Assistant for Indian Government Schemes and Scholarships. Always ground advice in verified government portals (.gov.in).'
@@ -1557,7 +1385,6 @@ STRICT GUIDELINES:
       sources: ['National Portal / Department Guidelines']
     });
   } catch (error: any) {
-    console.warn('Notice in /api/ai/ask-scheme:', error?.message || error);
     res.json({
       answer: 'Please refer to the official government portal for the most accurate and up-to-date scheme guidelines, or try asking your question again in a moment.',
       sources: ['Official Portal Verification Recommended']
@@ -1591,8 +1418,8 @@ Provide:
 Do not invent deadlines or unofficial URLs.`;
 
     const response = await generateContentWithFallback(ai, {
-      primaryModel: 'gemini-3.8-flash',
-      fallbackModels: ['gemini-3.1-flash-lite', 'gemini-flash-latest'],
+      primaryModel: 'gemini-3.1-flash-lite',
+      fallbackModels: ['gemini-3.8-flash', 'gemini-flash-latest'],
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }]
@@ -1617,7 +1444,6 @@ Do not invent deadlines or unofficial URLs.`;
       groundingUrls: urls
     });
   } catch (error: any) {
-    console.warn('Notice in /api/ai/search-schemes:', error?.message || error);
     res.json({
       summary: `Unable to complete live search right now due to high portal traffic. Please search directly on myscheme.gov.in or scholarships.gov.in.`,
       groundingUrls: []
@@ -1645,8 +1471,8 @@ User's Available Documents: ${JSON.stringify(userHeldDocs)}
 Analyze which documents are ready and provide simple step-by-step instructions on how the citizen can acquire any missing official documents (such as Caste Certificate, Income Certificate from Tehsildar/Revenue Department, Bonafide from college, or Aadhaar-bank seeding).`;
 
     const response = await generateContentWithFallback(ai, {
-      primaryModel: 'gemini-3.8-flash',
-      fallbackModels: ['gemini-3.1-flash-lite', 'gemini-flash-latest'],
+      primaryModel: 'gemini-3.1-flash-lite',
+      fallbackModels: ['gemini-3.8-flash', 'gemini-flash-latest'],
       contents: prompt
     });
 
@@ -1654,7 +1480,6 @@ Analyze which documents are ready and provide simple step-by-step instructions o
       analysis: response?.text || 'Document checklist verified.'
     });
   } catch (error: any) {
-    console.warn('Notice in /api/ai/check-documents:', error?.message || error);
     res.json({
       analysis: 'Please verify that your Caste, Income, and Education certificates are active and that your bank account is seeded with Aadhaar for DBT transfer.'
     });

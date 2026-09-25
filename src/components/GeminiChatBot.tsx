@@ -398,7 +398,13 @@ export const GeminiChatBot: React.FC<{ onSelectScheme?: (scheme: Scheme) => void
           text: m.text
         }));
 
-      const profileToSend = currentUser || {
+      const profileToSend = currentUser ? {
+        ...currentUser,
+        isStudent: currentUser.isStudent ?? (currentUser.employmentStatus === 'Student'),
+        isFarmer: currentUser.isFarmer ?? (currentUser.employmentStatus === 'Farmer'),
+        isSeniorCitizen: currentUser.isSeniorCitizen ?? (currentUser.employmentStatus === 'Senior Citizen' || (currentUser.age && currentUser.age >= 60)),
+        isWomanEntrepreneur: currentUser.isWomanEntrepreneur ?? (currentUser.employmentStatus === 'Women')
+      } : {
         id: 'guest-citizen',
         email: 'citizen@yojanamitra.gov.in',
         name: 'Citizen',
@@ -508,19 +514,25 @@ export const GeminiChatBot: React.FC<{ onSelectScheme?: (scheme: Scheme) => void
         );
       });
 
-      let fallbackText = activeLanguage === 'telugu'
-        ? `మీ ప్రొఫైల్ మరియు ప్రశ్న ఆధారంగా ధృవీకరించబడిన అధికారిక పథకాలు & స్కాలర్‌షిప్‌లు:\n\n`
-        : `Here are active government schemes and scholarships matching your query:\n\n`;
+      let fallbackText = '';
+      if (/^(hi|hello|hey|namaste|నమస్కారం)/i.test(textToSend.trim())) {
+        fallbackText = activeLanguage === 'telugu'
+          ? `నమస్కారం! 🙏 నేను **యోజనా మిత్ర AI** ని. నేను మీకు రాష్ట్ర సంక్షేమ పథకాలు, విద్యా స్కాలర్‌షిప్‌లు, మరియు అధికారిక దరఖాస్తు విధానం గురించి ఎలా సహాయపడగలను?`
+          : `Namaste! 🙏 I am **Yojana Mitra AI**, your Government Scheme & Scholarship Assistant. How can I help you today with welfare schemes, scholarships, or application guidance?`;
+      } else {
+        fallbackText = activeLanguage === 'telugu'
+          ? `తాత్కాలిక నెట్‌వర్క్ అంతరాయం కారణంగా సమాధానం ఆలస్యమైంది. దయచేసి మీ ప్రశ్నను మళ్లీ ప్రయత్నించండి.\n\nమీ ప్రశ్న ఆధారంగా ధృవీకరించబడిన అధికారిక పథకాలు & స్కాలర్‌షిప్‌లు ఇక్కడ ఉన్నాయి:\n\n`
+          : `I experienced a temporary connection delay while generating a direct answer. Please try asking your question again.\n\nIn the meantime, here are verified government programs related to your query:\n\n`;
 
-      matched.slice(0, 4).forEach((s, idx) => {
-        const benefit = s.financialBenefitAmount || (s.benefits && s.benefits[0]) || 'Direct Government Benefit';
-        const criteria = (s.eligibility && s.eligibility[0]) || s.shortDescription || 'Refer official notification';
-        const docs = (s.requiredDocuments && s.requiredDocuments.length > 0) ? s.requiredDocuments.slice(0, 3).join(', ') : 'Aadhaar, Income & Caste Certificates';
-        const portalName = s.officialSource || 'Official Government Portal';
-        const portalUrl = s.officialWebsite || 'https://www.myscheme.gov.in';
+        matched.slice(0, 4).forEach((s, idx) => {
+          const criteria = (s.eligibility && s.eligibility[0]) || s.shortDescription || 'Refer official notification';
+          const docs = (s.requiredDocuments && s.requiredDocuments.length > 0) ? s.requiredDocuments.slice(0, 3).join(', ') : 'Aadhaar, Income & Caste Certificates';
+          const portalName = s.officialSource || 'Official Government Portal';
+          const portalUrl = s.officialWebsite || 'https://www.myscheme.gov.in';
 
-        fallbackText += `${idx + 1}.\n**Scheme Name:** ${s.name}\n**Requirements:** ${criteria}. Documents: ${docs}\n**Why it suits you:** ${s.shortDescription}\n**Deadline:** Check Official Portal\n**Official Portal Link:** [${portalName}](${portalUrl})\n\n`;
-      });
+          fallbackText += `${idx + 1}.\n**Scheme Name:** ${s.name}\n**Requirements:** ${criteria}. Documents: ${docs}\n**Why it suits you:** ${s.shortDescription}\n**Deadline:** Check Official Portal\n**Official Portal Link:** [${portalName}](${portalUrl})\n\n`;
+        });
+      }
 
       setMessages(prev => [
         ...prev,

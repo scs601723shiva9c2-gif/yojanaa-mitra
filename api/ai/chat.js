@@ -17,8 +17,8 @@ function getGenAI() {
 
 async function generateContentWithFallback(ai, options) {
   const modelsToTry = [
-    options.primaryModel || 'gemini-3.8-flash',
-    ...(options.fallbackModels || ['gemini-3.1-flash-lite', 'gemini-flash-latest'])
+    options.primaryModel || 'gemini-3.1-flash-lite',
+    ...(options.fallbackModels || ['gemini-3.8-flash', 'gemini-flash-latest'])
   ];
 
   for (let i = 0; i < modelsToTry.length; i++) {
@@ -380,14 +380,26 @@ ${isTeluguRequested ? `CRITICAL MANDATORY DIRECTIVE - RESPOND ENTIRELY IN TELUGU
 **Deadline:** [Active deadline date or 'Check Official Portal']
 **Official Portal Link:** [Direct clickable official state government link e.g. [AP JnanaBhumi Portal](https://jnanabhumi.ap.gov.in)]`}
 
+CORE DIRECTIVES:
+1. ALWAYS DIRECTLY ANSWER THE CITIZEN'S SPECIFIC QUESTION OR QUERY:
+   - Your primary duty is to directly, accurately, and thoroughly answer whatever the user asked (procedures, requirements, eligibility, certificates from MeeSeva, greetings, or questions).
+   - Never ignore the user's question to dump an unrelated scheme list.
+2. SCHEME RECOMMENDATION FORMAT (WHEN SCHEMES ARE REQUESTED):
+   - When suggesting schemes, output them in clear text format:
+   1.
+   **Scheme Name:** [Official Scheme Name]
+   **Requirements:** [Eligibility criteria & Required Documents]
+   **Why it suits you:** [Clear reason explaining why it suits the citizen]
+   **Deadline:** [Active deadline date or 'Check Official Portal']
+   **Official Portal Link:** [Direct clickable official government link]
+
 RULES:
-1. STRICT STATE SCHEMES ONLY: You EXCLUSIVELY recommend State Government schemes (focusing on Andhra Pradesh and Telangana State Governments).
-   - CRITICAL: STRICTLY EXCLUDE Central Government schemes. Do NOT recommend or reference Central schemes under any circumstance.
-   - For Andhra Pradesh, reflect current active flagship state schemes: Annadata Sukhibhava (₹20,000/yr farmer input grant), Dr. NTR Vaidya Seva (₹25 Lakh universal health coverage), NTR Bharosa Pension (₹4,000/mo elderly/widows, ₹6,000 for PwD), Thalliki Vandanam (₹15,000/school student), Deepam 2.0 (3 Free LPG Cylinders/yr), Maha Shakti Free RTC Bus Travel for Women, Yuva Galam (₹3,000/mo unemployment aid), and JnanaBhumi Vidya Deevena & Vasathi Deevena.
-2. STRICT PROFILE RELEVANCE & SEPARATION: Only recommend schemes that strictly match the citizen's specified Employment Status:
-   - For Employment Status "Women": Focus exclusively on women-specific state initiatives (e.g., Andhra Pradesh Maha Shakti Free RTC Bus Travel for Women, Maha Shakti Aadabidda Nidhi ₹1,500/month, Deepam 2.0 Free LPG Cylinders, Sunna Vaddi Zero-Interest DWCRA Loans, YSR Cheyutha). DO NOT recommend Senior Citizen pensions (such as NTR Bharosa Old Age Pension) to users with status "Women" unless they explicitly ask for senior citizen schemes.
-   - For Employment Status "Senior Citizen": Focus exclusively on senior citizen & elderly welfare (e.g., Andhra Pradesh NTR Bharosa Senior Citizen Pension ₹4,000/month, Dr. NTR Vaidya Seva Geriatric Healthcare ₹25 Lakh with Aarogya Aasara, AP Vayo Vandana Assistive Devices, APSRTC Senior Citizen 25% Bus Concession). DO NOT recommend schemes meant exclusively for women to Senior Citizens.
-3. OFFICIAL PORTALS: Restrict factual verification strictly to official state government portals (.gov.in, .nic.in, .apcfss.in).
+1. FOCUS ON ANDHRA PRADESH & TELANGANA (alongside Pan-India Central schemes):
+   - For Andhra Pradesh: Annadata Sukhibhava, Dr. NTR Vaidya Seva, NTR Bharosa, Thalliki Vandanam, Deepam 2.0, Maha Shakti, Yuva Galam, JnanaBhumi Vidya & Vasathi Deevena.
+   - For Telangana: Telangana ePASS, Maha Lakshmi, Overseas Vidya Nidhi, TASK, Rythu Bharosa, Kalyana Lakshmi, Rajiv Aarogyasri.
+2. STRICT PROFILE RELEVANCE:
+   - Only recommend schemes that strictly match the citizen's specified Employment/Student Status.
+3. OFFICIAL PORTALS: Restrict factual verification strictly to official government portals (.gov.in, .nic.in).
 4. NEVER invent deadlines. Mark "Check Official Portal" if unspecified.`;
 
     const contents = [];

@@ -43,7 +43,7 @@ CRITICAL: Only search for and return State Government schemes enacted by the Sta
 Provide genuine active state government schemes with official state government portal application links (.gov.in / .nic.in / .apcfss.in).`;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: 'gemini-3.1-flash-lite',
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }]
